@@ -7,8 +7,9 @@ import base64
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart   # ← NEW: for HTML emails
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
+from urllib.parse import quote as url_quote
 
 import requests
 import uvicorn
@@ -33,9 +34,14 @@ HF_API_KEY          = os.getenv("HF_API_KEY",          "")
 HF_MODEL            = os.getenv("HF_MODEL",            "black-forest-labs/FLUX.1-schnell")
 HF_FALLBACK_MODEL   = os.getenv("HF_FALLBACK_MODEL",   "stabilityai/stable-diffusion-xl-base-1.0")
 GOOGLE_SCRIPT_URL   = os.getenv("GOOGLE_SCRIPT_URL",   "")
-SMTP_EMAIL          = os.getenv("SMTP_EMAIL",          "")
-SMTP_APP_PASSWORD   = os.getenv("SMTP_APP_PASSWORD",   "").replace(" ", "")
 ALLOWED_ORIGINS     = os.getenv("ALLOWED_ORIGINS",     "*").split(",")
+
+# ── Email config ──────────────────────────────────────────
+RESEND_API_KEY      = os.getenv("RESEND_API_KEY",      "")          # Primary: Resend
+SMTP_EMAIL          = os.getenv("SMTP_EMAIL",          "")          # Fallback: Gmail SMTP
+SMTP_APP_PASSWORD   = os.getenv("SMTP_APP_PASSWORD",   "").replace(" ", "")
+FROM_EMAIL          = os.getenv("FROM_EMAIL",          "NexusAI <noreply@nexusai.com>")
+FRONTEND_URL        = os.getenv("FRONTEND_URL",        "https://mini-mlez.onrender.com")
 
 BASE_DIR = Path(__file__).parent.resolve()
 
@@ -63,8 +69,12 @@ if GROQ_API_KEY:
     except Exception as e:
         print(f"⚠️  Groq init failed: {e}")
 
-if not SMTP_EMAIL or not SMTP_APP_PASSWORD:
-    print("⚠️  SMTP not configured — email features disabled")
+if not RESEND_API_KEY and (not SMTP_EMAIL or not SMTP_APP_PASSWORD):
+    print("⚠️  No email provider configured — set RESEND_API_KEY or SMTP credentials")
+else:
+    provider = "Resend" if RESEND_API_KEY else "Gmail SMTP"
+    print(f"✅ Email provider: {provider}  |  FROM: {FROM_EMAIL}")
+
 if not GOOGLE_SCRIPT_URL:
     print("⚠️  GOOGLE_SCRIPT_URL not set — Sheet read/write disabled")
 if not HF_API_KEY:
@@ -73,7 +83,7 @@ if not HF_API_KEY:
 # ══════════════════════════════════════════════════════════
 #  APP
 # ══════════════════════════════════════════════════════════
-app = FastAPI(title="NexusAI Backend", version="6.0")
+app = FastAPI(title="NexusAI Backend", version="7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
@@ -93,7 +103,7 @@ OTP_TTL = 300
 
 
 # ══════════════════════════════════════════════════════════
-#  HELPERS — password / sheet
+#  HELPERS
 # ══════════════════════════════════════════════════════════
 
 def hash_password(password: str) -> str:
@@ -136,7 +146,7 @@ def sheet_update_password(email: str, password_hash: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════
-#  EMAIL TEMPLATES  (plain-text + HTML)
+#  EMAIL TEMPLATES
 # ══════════════════════════════════════════════════════════
 
 def _otp_plain(name: str, otp: str) -> str:
@@ -170,22 +180,13 @@ def _otp_html(name: str, otp: str) -> str:
                style="background:linear-gradient(145deg,#1a1a2e,#16213e);
                       border-radius:16px;border:1px solid #2d2d5e;
                       overflow:hidden;max-width:540px;width:100%;">
-
-          <!-- Header -->
           <tr>
-            <td align="center"
-                style="background:linear-gradient(135deg,#667eea,#764ba2);
-                       padding:32px 24px;">
+            <td align="center" style="background:linear-gradient(135deg,#667eea,#764ba2);padding:32px 24px;">
               <div style="font-size:32px;margin-bottom:8px;">🤖</div>
-              <h1 style="margin:0;color:#ffffff;font-size:26px;font-weight:700;
-                         letter-spacing:1px;">NexusAI</h1>
-              <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">
-                Email Verification
-              </p>
+              <h1 style="margin:0;color:#ffffff;font-size:26px;font-weight:700;letter-spacing:1px;">NexusAI</h1>
+              <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">Email Verification</p>
             </td>
           </tr>
-
-          <!-- Body -->
           <tr>
             <td style="padding:36px 40px 24px;">
               <p style="margin:0 0 8px;color:#a0a0c8;font-size:14px;">Hi <strong style="color:#c8c8ff;">{name}</strong>,</p>
@@ -193,69 +194,36 @@ def _otp_html(name: str, otp: str) -> str:
                 Welcome to <strong style="color:#667eea;">NexusAI</strong>! 🎉<br/>
                 Use the OTP below to verify your email address.
               </p>
-
-              <!-- OTP Box -->
               <table width="100%" cellpadding="0" cellspacing="0">
                 <tr>
                   <td align="center" style="padding:8px 0 28px;">
-                    <div style="display:inline-block;background:#0d0d1f;
-                                border:2px solid #667eea;border-radius:12px;
-                                padding:20px 48px;text-align:center;">
-                      <p style="margin:0 0 4px;color:#8080b0;font-size:11px;
-                                letter-spacing:2px;text-transform:uppercase;">
-                        Your OTP Code
-                      </p>
-                      <p style="margin:0;font-size:40px;font-weight:800;
-                                letter-spacing:10px;color:#ffffff;
-                                font-family:'Courier New',monospace;">
-                        {otp}
-                      </p>
+                    <div style="display:inline-block;background:#0d0d1f;border:2px solid #667eea;border-radius:12px;padding:20px 48px;text-align:center;">
+                      <p style="margin:0 0 4px;color:#8080b0;font-size:11px;letter-spacing:2px;text-transform:uppercase;">Your OTP Code</p>
+                      <p style="margin:0;font-size:40px;font-weight:800;letter-spacing:10px;color:#ffffff;font-family:'Courier New',monospace;">{otp}</p>
                     </div>
                   </td>
                 </tr>
               </table>
-
-              <!-- Timer badge -->
               <table width="100%" cellpadding="0" cellspacing="0">
                 <tr>
                   <td align="center" style="padding-bottom:28px;">
-                    <span style="background:#1e1e3f;border:1px solid #3d3d6b;
-                                 border-radius:20px;padding:6px 16px;
-                                 color:#f0a500;font-size:12px;font-weight:600;">
-                      ⏱ Valid for 5 minutes only
-                    </span>
+                    <span style="background:#1e1e3f;border:1px solid #3d3d6b;border-radius:20px;padding:6px 16px;color:#f0a500;font-size:12px;font-weight:600;">⏱ Valid for 5 minutes only</span>
                   </td>
                 </tr>
               </table>
-
-              <!-- Warning -->
-              <table width="100%" cellpadding="0" cellspacing="0"
-                     style="background:#1a1a30;border-left:3px solid #f0a500;
-                            border-radius:0 8px 8px 0;margin-bottom:28px;">
+              <table width="100%" cellpadding="0" cellspacing="0" style="background:#1a1a30;border-left:3px solid #f0a500;border-radius:0 8px 8px 0;margin-bottom:28px;">
                 <tr>
-                  <td style="padding:12px 16px;color:#c0b060;font-size:12px;line-height:1.5;">
-                    🔒 <strong>Never share this OTP.</strong> NexusAI will never ask for it by phone or chat.
-                  </td>
+                  <td style="padding:12px 16px;color:#c0b060;font-size:12px;line-height:1.5;">🔒 <strong>Never share this OTP.</strong> NexusAI will never ask for it by phone or chat.</td>
                 </tr>
               </table>
-
-              <p style="margin:0;color:#606080;font-size:12px;line-height:1.6;">
-                If you didn't sign up for NexusAI, you can safely ignore this email.
-              </p>
+              <p style="margin:0;color:#606080;font-size:12px;line-height:1.6;">If you didn't sign up for NexusAI, you can safely ignore this email.</p>
             </td>
           </tr>
-
-          <!-- Footer -->
           <tr>
-            <td align="center"
-                style="border-top:1px solid #2d2d5e;padding:20px 24px;">
-              <p style="margin:0;color:#50506a;font-size:11px;">
-                Powered by AI · Built for Everyone<br/>
-                <span style="color:#404060;">© 2026 NexusAI</span>
-              </p>
+            <td align="center" style="border-top:1px solid #2d2d5e;padding:20px 24px;">
+              <p style="margin:0;color:#50506a;font-size:11px;">Powered by AI · Built for Everyone<br/><span style="color:#404060;">© 2026 NexusAI</span></p>
             </td>
           </tr>
-
         </table>
       </td>
     </tr>
@@ -264,11 +232,13 @@ def _otp_html(name: str, otp: str) -> str:
 </html>"""
 
 
-def _reset_plain(otp: str) -> str:
+def _reset_plain(otp: str, link: str = "") -> str:
+    link_text = f"\nOr click this link to reset directly:\n{link}\n" if link else ""
     return (
         f"Hi,\n\n"
         f"Your NexusAI password reset code is:\n\n"
         f"    {otp}\n\n"
+        f"{link_text}"
         f"This code is valid for 5 minutes only.\n"
         f"If you did not request a password reset, ignore this email.\n\n"
         f"Best regards,\nThe NexusAI Team\n"
@@ -277,13 +247,32 @@ def _reset_plain(otp: str) -> str:
     )
 
 
-def _reset_html(otp: str) -> str:
+def _reset_html(otp: str, link: str = "") -> str:
+    btn_html = ""
+    if link:
+        btn_html = f"""
+              <table width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td align="center" style="padding:0 0 24px;">
+                    <a href="{link}"
+                       style="display:inline-block;background:linear-gradient(135deg,#e44d7b,#764ba2);
+                              color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;
+                              padding:14px 40px;border-radius:10px;letter-spacing:.5px;">
+                      🔐 Reset My Password
+                    </a>
+                    <p style="margin:12px 0 0;color:#606080;font-size:11px;">Button not working? Copy this link:<br/>
+                      <a href="{link}" style="color:#8080c0;word-break:break-all;">{link}</a>
+                    </p>
+                  </td>
+                </tr>
+              </table>"""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>NexusAI Password Reset</title>
+<title>NexusAI Password Reset</title>
 </head>
 <body style="margin:0;padding:0;background:#0f0f1a;font-family:'Segoe UI',Arial,sans-serif;">
   <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f0f1a;padding:40px 0;">
@@ -293,101 +282,60 @@ def _reset_html(otp: str) -> str:
                style="background:linear-gradient(145deg,#1a1a2e,#16213e);
                       border-radius:16px;border:1px solid #2d2d5e;
                       overflow:hidden;max-width:540px;width:100%;">
-
-          <!-- Header -->
           <tr>
-            <td align="center"
-                style="background:linear-gradient(135deg,#e44d7b,#764ba2);
-                       padding:32px 24px;">
+            <td align="center" style="background:linear-gradient(135deg,#e44d7b,#764ba2);padding:32px 24px;">
               <div style="font-size:32px;margin-bottom:8px;">🔐</div>
-              <h1 style="margin:0;color:#ffffff;font-size:26px;font-weight:700;
-                         letter-spacing:1px;">NexusAI</h1>
-              <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">
-                Password Reset Request
-              </p>
+              <h1 style="margin:0;color:#ffffff;font-size:26px;font-weight:700;letter-spacing:1px;">NexusAI</h1>
+              <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">Password Reset Request</p>
             </td>
           </tr>
-
-          <!-- Body -->
           <tr>
             <td style="padding:36px 40px 24px;">
               <p style="margin:0 0 24px;color:#a0a0c8;font-size:14px;line-height:1.6;">
                 We received a request to reset your NexusAI password.<br/>
-                Use the code below to set a new password.
+                Use the button below or enter the code manually.
               </p>
-
-              <!-- OTP Box -->
+              {btn_html}
               <table width="100%" cellpadding="0" cellspacing="0">
                 <tr>
                   <td align="center" style="padding:8px 0 28px;">
-                    <div style="display:inline-block;background:#0d0d1f;
-                                border:2px solid #e44d7b;border-radius:12px;
-                                padding:20px 48px;text-align:center;">
-                      <p style="margin:0 0 4px;color:#8080b0;font-size:11px;
-                                letter-spacing:2px;text-transform:uppercase;">
-                        Reset Code
-                      </p>
-                      <p style="margin:0;font-size:40px;font-weight:800;
-                                letter-spacing:10px;color:#ffffff;
-                                font-family:'Courier New',monospace;">
-                        {otp}
-                      </p>
+                    <div style="display:inline-block;background:#0d0d1f;border:2px solid #e44d7b;border-radius:12px;padding:20px 48px;text-align:center;">
+                      <p style="margin:0 0 4px;color:#8080b0;font-size:11px;letter-spacing:2px;text-transform:uppercase;">Reset Code</p>
+                      <p style="margin:0;font-size:40px;font-weight:800;letter-spacing:10px;color:#ffffff;font-family:'Courier New',monospace;">{otp}</p>
                     </div>
                   </td>
                 </tr>
               </table>
-
-              <!-- Timer badge -->
               <table width="100%" cellpadding="0" cellspacing="0">
                 <tr>
                   <td align="center" style="padding-bottom:28px;">
-                    <span style="background:#1e1e3f;border:1px solid #3d3d6b;
-                                 border-radius:20px;padding:6px 16px;
-                                 color:#f0a500;font-size:12px;font-weight:600;">
-                      ⏱ Valid for 5 minutes only
-                    </span>
+                    <span style="background:#1e1e3f;border:1px solid #3d3d6b;border-radius:20px;padding:6px 16px;color:#f0a500;font-size:12px;font-weight:600;">⏱ Valid for 5 minutes only</span>
                   </td>
                 </tr>
               </table>
-
-              <!-- Warning -->
-              <table width="100%" cellpadding="0" cellspacing="0"
-                     style="background:#1a1a30;border-left:3px solid #e44d7b;
-                            border-radius:0 8px 8px 0;margin-bottom:28px;">
+              <table width="100%" cellpadding="0" cellspacing="0" style="background:#1a1a30;border-left:3px solid #e44d7b;border-radius:0 8px 8px 0;margin-bottom:28px;">
                 <tr>
-                  <td style="padding:12px 16px;color:#c06080;font-size:12px;line-height:1.5;">
-                    🔒 <strong>Never share this code.</strong> NexusAI will never ask for it by phone or chat.
-                  </td>
+                  <td style="padding:12px 16px;color:#c06080;font-size:12px;line-height:1.5;">🔒 <strong>Never share this code.</strong> NexusAI will never ask for it by phone or chat.</td>
                 </tr>
               </table>
-
-              <p style="margin:0;color:#606080;font-size:12px;line-height:1.6;">
-                If you didn't request a password reset, your account is safe — just ignore this email.
-              </p>
+              <p style="margin:0;color:#606080;font-size:12px;line-height:1.6;">If you didn't request a password reset, your account is safe — just ignore this email.</p>
             </td>
           </tr>
-
-          <!-- Footer -->
           <tr>
-            <td align="center"
-                style="border-top:1px solid #2d2d5e;padding:20px 24px;">
-              <p style="margin:0;color:#50506a;font-size:11px;">
-                Powered by AI · Built for Everyone<br/>
-                <span style="color:#404060;">© 2026 NexusAI</span>
-              </p>
+            <td align="center" style="border-top:1px solid #2d2d5e;padding:20px 24px;">
+              <p style="margin:0;color:#50506a;font-size:11px;">Powered by AI · Built for Everyone<br/><span style="color:#404060;">© 2026 NexusAI</span></p>
             </td>
           </tr>
-
         </table>
       </td>
     </tr>
   </table>
 </body>
-</html>"""
+</html>
 
 
 # ══════════════════════════════════════════════════════════
-#  FAST ASYNC EMAIL (SMTP in thread-pool)
+#  EMAIL SENDING  (Resend primary → SMTP fallback)
 # ══════════════════════════════════════════════════════════
 
 def _send_email_sync(
@@ -396,48 +344,68 @@ def _send_email_sync(
     plain_body: str,
     html_body: str = "",
 ) -> tuple[bool, str]:
-    if not SMTP_EMAIL or not SMTP_APP_PASSWORD:
-        return False, "SMTP not configured on server"
 
-    # Build multipart/alternative so clients show HTML when supported
+    # ── 1. Try Resend ─────────────────────────────────────
+    if RESEND_API_KEY:
+        try:
+            r = requests.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from":    FROM_EMAIL,
+                    "to":      [to_email],
+                    "subject": subject,
+                    "html":    html_body or f"<pre style='font-family:sans-serif'>{plain_body}</pre>",
+                    "text":    plain_body,
+                },
+                timeout=10,
+            )
+            if r.status_code in (200, 201):
+                print(f"📧 [Resend] Email sent → {to_email}: {subject}")
+                return True, "Email sent via Resend"
+            print(f"⚠️  Resend returned {r.status_code}: {r.text[:200]}  — trying SMTP fallback")
+        except Exception as e:
+            print(f"⚠️  Resend error: {e}  — trying SMTP fallback")
+
+    # ── 2. SMTP fallback ──────────────────────────────────
+    if not SMTP_EMAIL or not SMTP_APP_PASSWORD:
+        return False, "No email provider configured (set RESEND_API_KEY or SMTP credentials)"
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"]    = f"NexusAI <{SMTP_EMAIL}>"
+    msg["From"]    = FROM_EMAIL
     msg["To"]      = to_email
     msg.attach(MIMEText(plain_body, "plain", "utf-8"))
     if html_body:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    # Attempt 1 — SSL port 465
+    # Attempt 1 — SSL 465
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=8) as smtp:
             smtp.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
             smtp.send_message(msg)
-        print(f"📧 [SSL-465] Email sent → {to_email}: {subject}")
-        return True, "Email sent"
+        print(f"📧 [SMTP-SSL] Email sent → {to_email}")
+        return True, "Email sent via SMTP"
     except smtplib.SMTPAuthenticationError:
-        err = "SMTP auth failed — check your Gmail App Password formatting"
-        print(f"❌ {err}")
-        return False, err
+        return False, "SMTP auth failed — check your Gmail App Password"
     except Exception as e1:
-        print(f"⚠️  SSL-465 failed ({e1}), trying STARTTLS-587…")
+        print(f"⚠️  SMTP-SSL failed ({e1}), trying STARTTLS…")
 
-    # Attempt 2 — STARTTLS port 587
+    # Attempt 2 — STARTTLS 587
     try:
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=8) as smtp:
-            smtp.ehlo()
-            smtp.starttls()
-            smtp.ehlo()
+            smtp.ehlo(); smtp.starttls(); smtp.ehlo()
             smtp.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
             smtp.send_message(msg)
-        print(f"📧 [STARTTLS-587] Email sent → {to_email}: {subject}")
-        return True, "Email sent"
+        print(f"📧 [SMTP-TLS] Email sent → {to_email}")
+        return True, "Email sent via SMTP/TLS"
     except smtplib.SMTPAuthenticationError:
-        err = "SMTP auth failed on STARTTLS — check App Password"
-        print(f"❌ {err}")
-        return False, err
+        return False, "SMTP auth failed on TLS — check App Password"
     except Exception as e2:
-        err = f"Both SMTP attempts failed. SSL: {e1} | STARTTLS: {e2}"
+        err = f"Both SMTP attempts failed. SSL: {e1} | TLS: {e2}"
         print(f"❌ {err}")
         return False, err
 
@@ -448,7 +416,6 @@ async def send_email_async(
     plain_body: str,
     html_body: str = "",
 ):
-    """Offloads execution to thread pool."""
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(
         _smtp_executor, _send_email_sync, to_email, subject, plain_body, html_body
@@ -514,8 +481,8 @@ async def api_send_otp(data: SendOTPRequest, background_tasks: BackgroundTasks):
     if not name or not email:
         return {"success": False, "message": "Name and email are required"}
 
-    if not SMTP_EMAIL or not SMTP_APP_PASSWORD:
-        return {"success": False, "message": "Email service is temporarily unavailable on this server"}
+    if not RESEND_API_KEY and (not SMTP_EMAIL or not SMTP_APP_PASSWORD):
+        return {"success": False, "message": "Email service is temporarily unavailable"}
 
     existing = sheet_find_user(email)
     if existing.get("success"):
@@ -537,7 +504,7 @@ async def api_send_otp(data: SendOTPRequest, background_tasks: BackgroundTasks):
         _otp_html(name, otp),
     )
 
-    return {"success": True, "message": "OTP is being processed — check your inbox shortly"}
+    return {"success": True, "message": "Verification code sent — check your inbox"}
 
 
 @app.post("/resend-otp")
@@ -546,7 +513,7 @@ async def api_resend_otp(data: ResendOTPRequest, background_tasks: BackgroundTas
     pending = otp_store.get(email)
 
     if not pending:
-        return {"success": False, "message": "No pending signup for this email — register again"}
+        return {"success": False, "message": "No pending signup — register again"}
 
     new_otp = str(random.randint(100000, 999999))
     pending["otp"]        = new_otp
@@ -561,7 +528,7 @@ async def api_resend_otp(data: ResendOTPRequest, background_tasks: BackgroundTas
         _otp_html(pending["name"], new_otp),
     )
 
-    return {"success": True, "message": "New OTP is being dispatched"}
+    return {"success": True, "message": "New code sent"}
 
 
 @app.post("/verify-otp")
@@ -570,15 +537,15 @@ def api_verify_otp(data: VerifyOTPRequest):
     pending = otp_store.get(email)
 
     if not pending:
-        return {"success": False, "message": "No pending signup found — please register again"}
+        return {"success": False, "message": "No pending signup — register again"}
     if time.time() > pending["expires_at"]:
         del otp_store[email]
-        return {"success": False, "message": "OTP has expired — click Resend"}
+        return {"success": False, "message": "Code expired — click Resend"}
     if data.otp.strip() != pending["otp"]:
-        return {"success": False, "message": "Incorrect OTP — try again"}
+        return {"success": False, "message": "Incorrect code — try again"}
 
     otp_store[email]["verified"] = True
-    return {"success": True, "message": "OTP verified"}
+    return {"success": True, "message": "Verified"}
 
 
 @app.post("/save-password")
@@ -588,9 +555,9 @@ def api_save_password(data: SavePasswordRequest):
     pending  = otp_store.get(email)
 
     if not pending:
-        return {"success": False, "message": "Session expired — please register again"}
+        return {"success": False, "message": "Session expired — register again"}
     if not pending.get("verified"):
-        return {"success": False, "message": "OTP not yet verified"}
+        return {"success": False, "message": "Email not yet verified"}
     if len(password) < 6:
         return {"success": False, "message": "Password must be at least 6 characters"}
 
@@ -616,7 +583,7 @@ def api_login(data: LoginRequest):
 
     status = str(user.get("status") or user.get("Status", "")).lower()
     if status != "active":
-        return {"success": False, "message": "Account is not active — contact support"}
+        return {"success": False, "message": "Account not active — contact support"}
 
     sheet_hash = (
         user.get("passwordHash")
@@ -642,20 +609,24 @@ async def api_forgot_password(data: ForgotPasswordRequest, background_tasks: Bac
 
     user = sheet_find_user(email)
     if not user.get("success"):
-        return {"success": True, "message": "If that email is registered, a reset code was sent"}
+        # Don't reveal whether email exists
+        return {"success": True, "message": "If that email is registered, a reset link was sent"}
 
     otp = str(random.randint(100000, 999999))
     reset_store[email] = {"otp": otp, "expires_at": time.time() + OTP_TTL}
 
+    # Build direct reset link for the email button
+    reset_link = f"{FRONTEND_URL}/change-password.html?email={url_quote(email)}&token={otp}"
+
     background_tasks.add_task(
         send_email_async,
         email,
-        "NexusAI Password Reset Code",
-        _reset_plain(otp),
-        _reset_html(otp),
+        "NexusAI — Password Reset",
+        _reset_plain(otp, reset_link),
+        _reset_html(otp, reset_link),
     )
 
-    return {"success": True, "message": "Reset code queued for sending"}
+    return {"success": True, "message": "Reset link sent — check your inbox"}
 
 
 @app.post("/reset-password")
@@ -664,12 +635,12 @@ def api_reset_password(data: ResetPasswordRequest):
     pending = reset_store.get(email)
 
     if not pending:
-        return {"success": False, "message": "No reset request found — request a new code"}
+        return {"success": False, "message": "No reset request found — request a new link"}
     if time.time() > pending["expires_at"]:
         del reset_store[email]
-        return {"success": False, "message": "Reset code expired — request a new one"}
+        return {"success": False, "message": "Link expired — request a new one"}
     if data.otp.strip() != pending["otp"]:
-        return {"success": False, "message": "Incorrect reset code — try again"}
+        return {"success": False, "message": "Invalid reset token"}
     if len(data.password) < 6:
         return {"success": False, "message": "Password must be at least 6 characters"}
 
@@ -697,7 +668,7 @@ def chat_with_ai(data: ChatRequest) -> dict:
     try:
         if provider == "gemini":
             if not gemini_client:
-                msg = "❌ Gemini API key not set. Add GEMINI_API_KEY to your .env file."
+                msg = "❌ Gemini API key not set."
                 return {"response": msg, "reply": msg, "error": False}
 
             history_text = ""
@@ -713,7 +684,7 @@ def chat_with_ai(data: ChatRequest) -> dict:
 
         elif provider == "groq":
             if not groq_client:
-                msg = "❌ Groq API key not set. Add GROQ_API_KEY to your .env file."
+                msg = "❌ Groq API key not set."
                 return {"response": msg, "reply": msg, "error": False}
 
             messages = [{"role": h.role, "content": h.content} for h in (data.history or [])]
@@ -739,7 +710,6 @@ def chat_with_ai(data: ChatRequest) -> dict:
 def chat(data: ChatRequest):
     return chat_with_ai(data)
 
-
 @app.post("/api/chat")
 def chat_api(data: ChatRequest):
     return chat_with_ai(data)
@@ -756,10 +726,7 @@ def _hf_post(model: str, payload: dict, headers: dict, timeout: int) -> requests
 
 def generate_image_hf(prompt: str, retries: int = 6) -> dict:
     if not HF_API_KEY:
-        return {
-            "success": False,
-            "message": "Image generation not configured — add HF_API_KEY to .env",
-        }
+        return {"success": False, "message": "Image generation not configured — add HF_API_KEY to .env"}
 
     headers = {
         "Authorization":    f"Bearer {HF_API_KEY}",
@@ -770,80 +737,53 @@ def generate_image_hf(prompt: str, retries: int = 6) -> dict:
 
     def attempt_model(model_id: str, max_tries: int) -> dict | None:
         for attempt in range(1, max_tries + 1):
-            print(f"🎨 [{model_id}] attempt {attempt}/{max_tries}: {prompt[:60]}…")
+            print(f"🎨 [{model_id}] attempt {attempt}/{max_tries}")
             try:
                 r            = _hf_post(model_id, payload, headers, timeout=180)
                 content_type = r.headers.get("content-type", "application/octet-stream")
 
                 if r.status_code == 200 and content_type.startswith("image"):
                     b64 = base64.b64encode(r.content).decode()
-                    print(f"✅ [{model_id}] generated ({len(r.content) // 1024} KB)")
+                    print(f"✅ [{model_id}] generated ({len(r.content)//1024} KB)")
                     return {"success": True, "image": f"data:{content_type};base64,{b64}"}
 
-                try:
-                    err_data = r.json()
-                except Exception:
-                    return {"success": False, "message": f"HF error HTTP {r.status_code}"}
+                try:   err_data = r.json()
+                except: return {"success": False, "message": f"HF error HTTP {r.status_code}"}
 
                 if isinstance(err_data, dict) and "estimated_time" in err_data:
                     wait = min(float(err_data.get("estimated_time", 25)), 40)
-                    print(f"⏳ [{model_id}] loading, waiting {wait:.0f} s…")
-                    time.sleep(wait)
-                    continue
+                    print(f"⏳ Loading, waiting {wait:.0f}s…")
+                    time.sleep(wait); continue
 
-                err_msg = (
-                    err_data.get("error")
-                    if isinstance(err_data, dict)
-                    else str(err_data)
-                )
+                err_msg = err_data.get("error") if isinstance(err_data, dict) else str(err_data)
                 print(f"❌ [{model_id}] HF error: {err_msg}")
                 return {"success": False, "message": err_msg or f"HF HTTP {r.status_code}"}
 
             except requests.exceptions.Timeout:
                 if attempt < max_tries:
-                    print(f"⏳ [{model_id}] timeout on attempt {attempt}, retrying…")
-                    time.sleep(5)
-                    continue
-                return {
-                    "success": False,
-                    "message": "Request timed out — the model may be overloaded. Try again.",
-                }
+                    print(f"⏳ Timeout on attempt {attempt}, retrying…"); time.sleep(5); continue
+                return {"success": False, "message": "Request timed out — try again"}
             except Exception as e:
                 return {"success": False, "message": str(e)}
-
         return None
 
     result = attempt_model(HF_MODEL, retries)
-
     if result is None or (not result.get("success") and HF_FALLBACK_MODEL and HF_FALLBACK_MODEL != HF_MODEL):
         primary_msg = (result or {}).get("message", "unknown")
-        print(f"⚠️  Primary model failed ({primary_msg}), trying fallback: {HF_FALLBACK_MODEL}")
+        print(f"⚠️  Primary model failed ({primary_msg}), trying fallback…")
         fallback = attempt_model(HF_FALLBACK_MODEL, 3)
-        if fallback and fallback.get("success"):
-            return fallback
-        if result and not result.get("success"):
-            return result
-        return fallback or {
-            "success": False,
-            "message": "Both primary and fallback models failed. Try again in 30 s.",
-        }
+        if fallback and fallback.get("success"): return fallback
+        if result and not result.get("success"): return result
+        return fallback or {"success": False, "message": "Both models failed. Try again in 30 s."}
 
-    if result is None:
-        return {
-            "success": False,
-            "message": "Model is still warming up on Hugging Face. Wait 30 s and try again.",
-        }
-
-    return result
+    return result or {"success": False, "message": "Model warming up. Wait 30 s and try again."}
 
 
 @app.post("/generate-image")
 def api_generate_image(data: ImageGenRequest):
     prompt = (data.prompt or "").strip()
-    if not prompt:
-        return {"success": False, "message": "Prompt cannot be empty"}
-    if len(prompt) > 500:
-        return {"success": False, "message": "Prompt too long — keep it under 500 characters"}
+    if not prompt:        return {"success": False, "message": "Prompt cannot be empty"}
+    if len(prompt) > 500: return {"success": False, "message": "Prompt too long — keep it under 500 characters"}
     return generate_image_hf(prompt)
 
 
@@ -854,17 +794,16 @@ def api_generate_image(data: ImageGenRequest):
 @app.get("/health")
 def health():
     return {
-        "status":          "ok",
-        "version":         "6.0",
-        "gemini":          gemini_client is not None,
-        "groq":            groq_client   is not None,
-        "hf":              bool(HF_API_KEY),
-        "hf_model":        HF_MODEL,
-        "hf_fallback":     HF_FALLBACK_MODEL,
-        "smtp":            bool(SMTP_EMAIL and SMTP_APP_PASSWORD),
-        "sheet":           bool(GOOGLE_SCRIPT_URL),
-        "pending_otps":    len(otp_store),
-        "pending_resets":  len(reset_store),
+        "status":         "ok",
+        "version":        "7.0",
+        "gemini":         gemini_client is not None,
+        "groq":           groq_client   is not None,
+        "hf":             bool(HF_API_KEY),
+        "resend":         bool(RESEND_API_KEY),
+        "smtp":           bool(SMTP_EMAIL and SMTP_APP_PASSWORD),
+        "sheet":          bool(GOOGLE_SCRIPT_URL),
+        "pending_otps":   len(otp_store),
+        "pending_resets": len(reset_store),
     }
 
 
@@ -875,16 +814,13 @@ def health():
 @app.get("/")
 def serve_frontend():
     p = BASE_DIR / "index.html"
-    if p.exists():
-        return FileResponse(str(p))
-    return JSONResponse({"message": "NexusAI API v6 — frontend not bundled here"})
-
+    if p.exists(): return FileResponse(str(p))
+    return JSONResponse({"message": "NexusAI API v7 — frontend not bundled"})
 
 @app.get("/{file_path:path}")
 def serve_static(file_path: str):
     p = BASE_DIR / file_path
-    if p.exists() and p.is_file():
-        return FileResponse(str(p))
+    if p.exists() and p.is_file(): return FileResponse(str(p))
     return JSONResponse({"error": f"Not found: {file_path}"}, status_code=404)
 
 
@@ -893,7 +829,7 @@ def serve_static(file_path: str):
 # ══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(f"\n🚀 NexusAI Backend v6")
+    print(f"\n🚀 NexusAI Backend v7")
     print(f"📁 Serving from: {BASE_DIR}")
     print(f"🌐 Open:         http://127.0.0.1:5000\n")
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
